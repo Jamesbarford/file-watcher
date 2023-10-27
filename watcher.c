@@ -136,11 +136,12 @@ void watchStateAddFiles(watchState *ws, int argc, ...) {
     va_end(ap);
 }
 
-int watchStateAddDirectory(watchState *ws, char *dirname) {
+int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
+                           int extlen) {
     DIR *dir = opendir(dirname);
     struct dirent *dr;
     struct stat sb;
-    int files_open = 0, len = 0;
+    int files_open = 0, len = 0, should_add = 0;
     char full_path[1024];
 
     if (dir == NULL) {
@@ -155,13 +156,27 @@ int watchStateAddDirectory(watchState *ws, char *dirname) {
                         dr->d_name[1] == '.') {
                 continue;
             }
+
+            should_add = 1;
             len = snprintf(full_path, sizeof(full_path), "%s%s", dirname,
                            dr->d_name);
             full_path[len] = '\0';
-            watchStateAddFile(ws, full_path);
+            if (ext) {
+                for (int i = len - 1, j = extlen - 1; j; --i) {
+                    if (full_path[i] != ext[j]) {
+                        should_add = 0;
+                        break;
+                    }
+                    j--;
+                }
+            }
+            if (should_add) {
+                printf("ADDING : %s\n ", full_path);
+                watchStateAddFile(ws, full_path);
+            }
             break;
         case DT_DIR:
-            fwWarn("Directories not yet supported\n");
+            fwWarn("Directories not yet supported: %s\n", dr->d_name);
             break;
         default:
             break;
@@ -190,13 +205,11 @@ void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
     } else if (type & FW_EVT_WATCH) {
         printf("CHANGED: %s\n", fw->name);
     }
-
     if (fstat(fw->fd, &sb) == -1) {
         fwWarn("Could not update stats for file: %s\n", fw->name);
         return;
     }
 
-    /* This is very raw */
     FILE *fp = popen(command, "r");
     if (fp == NULL) {
         fwWarn("Failed to run command: %s\n", command);
@@ -238,11 +251,18 @@ int main(int argc, char **argv) {
     char *dirname = argv[2];
     watchState *ws = watchStateNew(command, INT_MAX);
 
-    watchStateAddFiles(ws, 4, "./main.c", "./fw.c", "./fw.h", "./Makefile");
+    watchStateAddDirectory(ws, dirname, ".c", 2);
+    watchStateAddDirectory(ws, dirname, ".h", 2);
+    watchStateAddFile(ws, "./Makefile");
 
     if (ws->count == 0) {
         fwPanic("Failed to open all files\n");
     }
+    printf("WATCHING: ");
+    for (int i = 0; i < ws->count; ++i) {
+        printf("%s ", ws->fws[i].name);
+    }
+    printf("\n");
     watchForChanges(ws);
     return EXIT_SUCCESS;
 }
