@@ -147,6 +147,8 @@ static int fwPoll(fwLoop *fwl) {
 
     return fdcount;
 }
+#elif defined(__linux__)
+#error "LINUX not yet supported"
 #endif
 /* MAC OS implementation END - kqueue
  * ===========================================================================*/
