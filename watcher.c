@@ -21,12 +21,26 @@ typedef struct watchedFile {
 } watchedFile;
 
 typedef struct watchState {
-    watchedFile *fws;
     size_t capacity;
     size_t count;
-    char *command;
     int max_open;
+    char *command;
+    watchedFile *fws;
 } watchState;
+
+typedef struct fileEntry {
+    int fd;
+    char *name;
+    int name_len;
+    struct fileEntry *next;
+} fileEntry;
+
+typedef struct fileTable {
+    int size;
+    int capacity;
+    int mask;
+    fileEntry **entries;
+} fileTable;
 
 static char *command = NULL;
 
@@ -61,6 +75,87 @@ static char *command = NULL;
 #else
 #error "Cannot determine how to get information time from 'struct stat'"
 #endif
+
+fileTable *fileTableNew(void) {
+    fileTable *ft = malloc(sizeof(fileTable));
+    ft->capacity = 16;
+    ft->mask = ft->capacity - 1;
+    ft->size = 0;
+    ft->entries = malloc(sizeof(fileEntry * ) * ft->capacity);
+    return ft;
+}
+
+int fileTableHas(fileTable *ft, int fd) {
+    if (fd == -1) {
+        return 0;
+    }
+
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *fe = ft->entries[hash_idx]; 
+    while (fe) {
+        if (fe->fd == fd) {
+            return 1;
+        }
+        fe = fe->next;
+    }
+    return 0;
+}
+
+int fileTableAdd(fileTable *ft, int fd, char *name, int name_len) {
+    if (fileTableHas(ft, fd)) {
+        return 0;
+    }
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *newfe = malloc(sizeof(fileEntry));
+    newfe->fd = fd;
+    newfe->name = name;
+    newfe->name_len = name_len;
+    newfe->next = ft->entries[hash_idx];
+    ft->entries[hash_idx] = newfe;
+    ft->size++;
+    return 0;
+}
+
+fileEntry *fileTableGet(fileTable *ft, int fd) {
+    if (fd == -1) {
+        return NULL;
+    }
+
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *fe = ft->entries[hash_idx]; 
+    while (fe) {
+        if (fe->fd == fd) {
+            return fe;
+        }
+        fe = fe->next;
+    }
+    return NULL;
+}
+
+fileEntry *fileTableDelete(fileTable *ft, int fd) {
+    fileEntry *prev, *next, *fe;
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+
+    fe = ft->entries[hash_idx];
+    prev = NULL;
+    while (fe) {
+        next = fe->next;
+        if (fe->fd) {
+            if (prev) {
+                prev->next = next;
+                fe->next = NULL;
+                return fe;
+            } else {
+                ft->entries[hash_idx] = next;
+                fe->next = NULL;
+                return fe;
+            }
+        }
+        prev = fe;
+        fe = fe->next;
+    } 
+    return NULL;
+}
 
 watchState *watchStateNew(char *command, int max_open) {
     watchState *ws = malloc(sizeof(watchState));
@@ -188,13 +283,14 @@ void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
             printf("DELETED: %s\n", fw->name);
             free(fw->name);
             free(fw);
-            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
+            fwLoopDeleteEvent(fwl, fd, fw->name, FW_EVT_WATCH);
             return;
         } else {
             printf("CHANGED: %s\n", fw->name);
-            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
+            fwLoopDeleteEvent(fwl, fd, fw->name, FW_EVT_WATCH);
             fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
-            fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH, watchFileListener, fw);
+            fwLoopAddEvent(fwl, fw->fd, fw->name, FW_EVT_WATCH,
+                    watchFileListener, fw);
         }
     } else if (type & FW_EVT_WATCH) {
         printf("CHANGED: %s\n", fw->name);
@@ -226,12 +322,13 @@ void watchForChanges(watchState *ws) {
         struct stat st;
         fstat(fw->fd, &st);
         fw->size = st.st_size;
-        fwLoopAddEvent(evt_loop, fw->fd, FW_EVT_WATCH, watchFileListener, fw);
+        fwLoopAddEvent(evt_loop, fw->fd, fw->name, FW_EVT_WATCH, watchFileListener, fw);
     }
 
     fwLoopMain(evt_loop);
     for (int i = 0; i < ws->count; ++i) {
-        fwLoopDeleteEvent(evt_loop, ws->fws[i].fd, FW_EVT_WATCH);
+        fwLoopDeleteEvent(evt_loop, ws->fws[i].fd, ws->fws[i].name,
+                FW_EVT_WATCH);
     }
     watchStateRelease(ws);
 }

@@ -20,9 +20,9 @@ void fwLoopProcessEvents(fwLoop *fwl);
 void fwLoopMain(fwLoop *fwl);
 void fwLoopStop(fwLoop *fwl);
 size_t fwLoopGetProcessedEventCount(fwLoop *fwl);
-void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask);
+void fwLoopDeleteEvent(fwLoop *fwl, int fd, char *name, int mask);
 fwLoop *fwLoopNew(int eventcount, int timeout);
-int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
+int fwLoopAddEvent(fwLoop *fwl, int fd, char *name, int mask, fwEvtCallback *cb,
                    void *data);
 
 #endif // !FW_H

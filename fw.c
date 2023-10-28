@@ -88,7 +88,8 @@ static void fwStateRelease(fwLoop *fwl) {
 }
 
 /* Add a something to watch to kqueue */
-static int fwStateAdd(fwLoop *fwl, int fd, int mask) {
+static int fwStateAdd(fwLoop *fwl, int fd, char *name, int mask) {
+    (void)name;
     fwEvtState *es = fwLoopGetState(fwl);
     struct kevent change;
 
@@ -148,7 +149,47 @@ static int fwPoll(fwLoop *fwl) {
     return fdcount;
 }
 #elif defined(__linux__)
-#error "LINUX not yet supported"
+#include <sys/inotify.h>
+
+typedef struct fwEvtState {
+    int wfd;
+} fwEvtState;
+
+/* https://stackoverflow.com/questions/16760364/using-inotify-why-is-my-watched-file-ignored */
+static int fwStateAdd(fwLoop *fwl, int fd, char *name, int mask) {
+    int wfd = 0;
+    fwEvtState *es = fwLoopGetState(fwl);
+    
+    if (mask & FW_EVT_WATCH) {
+        /* WE DO NEED TO USE THIS :( */
+        wfd = inotify_add_watch(es->wfd, name, IN_MODIFY | IN_ATTRIB | 
+                IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED);
+    }
+    return FW_EVT_OK;
+}
+static void fwStateDelete(fwLoop *fwl, int fd, char *name, int mask);
+static void fwStateRelease(fwLoop *fwl);
+static int fwPoll(fwLoop *fwl);
+
+static int fwStateCreate(fwLoop *fwl) {
+    fwEvtState *es;
+
+    if ((es = malloc(sizeof(fwEvtState))) == NULL) {
+        goto error;
+    }
+
+    if ((es->wfd = inotify_init()) == -1) {
+        goto error;
+    }
+
+    return FW_EVT_OK;
+error:
+    if (es) {
+        free(es);
+    }
+    return FW_EVT_ERR;
+}
+
 #endif
 /* MAC OS implementation END - kqueue
  * ===========================================================================*/
@@ -207,7 +248,7 @@ error:
     return NULL;
 }
 
-int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
+int fwLoopAddEvent(fwLoop *fwl, int fd, char *name, int mask, fwEvtCallback *cb,
                    void *data) {
     fwEvt *ev;
 
@@ -216,7 +257,7 @@ int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
     }
 
     ev = &fwl->idle[fd];
-    if (fwStateAdd(fwl, fd, mask) == FW_EVT_ERR) {
+    if (fwStateAdd(fwl, fd, name, mask) == FW_EVT_ERR) {
         return FW_EVT_ERR;
     }
 
@@ -232,7 +273,7 @@ int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
     return FW_EVT_OK;
 }
 
-void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask) {
+void fwLoopDeleteEvent(fwLoop *fwl, int fd, char *name, int mask) {
     fwEvt *ev;
     int i;
 
@@ -246,7 +287,7 @@ void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask) {
         return;
     }
 
-    fwStateDelete(fwl, fd, mask);
+    fwStateDelete(fwl, fd, name, mask);
     ev->mask = ev->mask & (~mask);
     if (fd == fwl->max && ev->mask == FW_EVT_ADD) {
         for (i = fwl->max - 1; i >= 0; --i) {
