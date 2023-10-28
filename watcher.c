@@ -51,20 +51,15 @@ static char *command = NULL;
 
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
 #define statFileUpdated(sb) (sb.st_mtimespec.tv_sec)
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
-        defined(__NetBSD__)
-#define statFileUpdated(sb) (sb.st_mtime)
-#else
-#error "Cannot determine how to get update time from 'struct stat'"
-#endif
-
-#if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
 #define statFileCreated(sb) (sb.st_birthtimespec.tv_sec)
+#define OPEN_FILE_FLAGS (O_RDONLY | O_EVTONLY)
 #elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
         defined(__NetBSD__)
-#define ststatFileCreated(sb) (sb.st_ctime;)
+#define statFileUpdated(sb) (sb.st_mtim.tv_sec)
+#define ststatFileCreated(sb) (sb.st_ctim.tv_sec)
+#define OPEN_FILE_FLAGS (O_RDONLY)
 #else
-#error "Cannot determine how to get created time from 'struct stat'"
+#error "Cannot determine how to get information time from 'struct stat'"
 #endif
 
 watchState *watchStateNew(char *command, int max_open) {
@@ -94,7 +89,6 @@ int watchStateAddFile(watchState *ws, char *file_name) {
 
     if (ws->count >= ws->max_open) {
         fwWarn("Trying to add more than: %d files\n", ws->max_open);
-        close(ws->count);
         return -1;
     }
 
@@ -103,7 +97,7 @@ int watchStateAddFile(watchState *ws, char *file_name) {
         ws->capacity *= 2;
     }
 
-    if ((fd = open(file_name, O_EVTONLY | O_RDONLY, 0644)) == -1) {
+    if ((fd = open(file_name, OPEN_FILE_FLAGS , 0644)) == -1) {
         return -1;
     }
 
@@ -199,7 +193,7 @@ void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
         } else {
             printf("CHANGED: %s\n", fw->name);
             fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
-            fw->fd = open(fw->name, O_EVTONLY | O_RDONLY, 0644);
+            fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
             fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH, watchFileListener, fw);
         }
     } else if (type & FW_EVT_WATCH) {

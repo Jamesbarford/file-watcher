@@ -1,4 +1,3 @@
-#include <sys/event.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +38,7 @@ typedef struct fwLoop {
  * ===========================================================================*/
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6) || \
         defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/event.h>
 
 typedef struct fwEvtState {
     int kfd;
