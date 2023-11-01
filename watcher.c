@@ -181,6 +181,7 @@ void watchStateRelease(watchState *ws) {
 int watchStateAddFile(watchState *ws, char *file_name) {
     struct stat sb;
     int fd;
+    char abspath[1048];
 
     if (ws->count >= ws->max_open) {
         fwWarn("Trying to add more than: %d files\n", ws->max_open);
@@ -203,8 +204,13 @@ int watchStateAddFile(watchState *ws, char *file_name) {
         return -1;
     }
 
+    if (realpath(file_name, abspath) == NULL) {
+        close(ws->fws[ws->count].fd);
+        return -1;
+    }
+
     ws->fws[ws->count].last_update = statFileUpdated(sb);
-    ws->fws[ws->count].name = strdup(file_name);
+    ws->fws[ws->count].name = strdup(abspath);
 
     ws->count++;
     return 0;
@@ -241,13 +247,13 @@ int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
         switch (dr->d_type) {
         case DT_REG:
             if (!strlen(dr->d_name) && dr->d_name[0] == '.' ||
-                !strlen(dr->d_name) && dr->d_name[0] == '.' &&
+                strlen(dr->d_name) == 2 && dr->d_name[0] == '.' &&
                         dr->d_name[1] == '.') {
                 continue;
             }
 
             should_add = 1;
-            len = snprintf(full_path, sizeof(full_path), "%s%s", dirname,
+            len = snprintf(full_path, sizeof(full_path), "%s/%s", dirname,
                            dr->d_name);
             full_path[len] = '\0';
             if (ext) {
@@ -277,25 +283,28 @@ int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
 void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
     watchedFile *fw = (watchedFile *)data;
     struct stat sb;
-    if (type & FW_EVT_DELETE) {
+
+    printf("IN LISTENER: 0x%0x 0x%0x\n", type, FW_EVT_DELETE|FW_EVT_WATCH);
+    if (type & (FW_EVT_DELETE|FW_EVT_WATCH)) {
+        printf("opening and closing\n");
         close(fw->fd);
         if (access(fw->name, F_OK) == -1 && errno == ENOENT) {
             printf("DELETED: %s\n", fw->name);
             free(fw->name);
             free(fw);
-            fwLoopDeleteEvent(fwl, fd, fw->name, FW_EVT_WATCH);
+            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
             return;
         } else {
-            printf("CHANGED: %s\n", fw->name);
-            fwLoopDeleteEvent(fwl, fd, fw->name, FW_EVT_WATCH);
+            printf("1CHANGED:%d-> %s\n",fw->fd, fw->name);
+            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
             fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
-            fwLoopAddEvent(fwl, fw->fd, fw->name, FW_EVT_WATCH,
+            fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH,
                     watchFileListener, fw);
         }
     } else if (type & FW_EVT_WATCH) {
-        printf("CHANGED: %s\n", fw->name);
+        printf("2CHANGED: %s\n", fw->name);
     }
-    if (fstat(fw->fd, &sb) == -1) {
+    if (stat(fw->name, &sb) == -1) {
         fwWarn("Could not update stats for file: %s\n", fw->name);
         return;
     }
@@ -322,13 +331,16 @@ void watchForChanges(watchState *ws) {
         struct stat st;
         fstat(fw->fd, &st);
         fw->size = st.st_size;
-        fwLoopAddEvent(evt_loop, fw->fd, fw->name, FW_EVT_WATCH, watchFileListener, fw);
+        if (fwLoopAddEvent(evt_loop, fw->fd, FW_EVT_WATCH, watchFileListener, fw) == FW_EVT_ERR) {
+            perror("??\n");
+            exit(1);
+        }
     }
 
+    printf("starting loop\n");
     fwLoopMain(evt_loop);
     for (int i = 0; i < ws->count; ++i) {
-        fwLoopDeleteEvent(evt_loop, ws->fws[i].fd, ws->fws[i].name,
-                FW_EVT_WATCH);
+        fwLoopDeleteEvent(evt_loop, ws->fws[i].fd, FW_EVT_WATCH);
     }
     watchStateRelease(ws);
 }
@@ -344,7 +356,7 @@ int main(int argc, char **argv) {
 
     watchStateAddDirectory(ws, dirname, ".c", 2);
     watchStateAddDirectory(ws, dirname, ".h", 2);
-    watchStateAddFile(ws, "./Makefile");
+    //watchStateAddFile(ws, "./foo.txt");
 
     if (ws->count == 0) {
         fwPanic("Failed to open all files\n");

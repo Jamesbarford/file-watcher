@@ -1,14 +1,14 @@
 TARGET := watchme.out
 CC     := gcc
 OUTDIR := .
-CFLAGS = -O0 -DDEBUG
+CFLAGS = -O0 -DDEBUG -g
 
 $(OUTDIR)/%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 all: $(TARGET)
 
-OBJS = watcher.o fw.o
+OBJS = $(OUTDIR)/watcher.o $(OUTDIR)/fw.o
 
 $(TARGET): $(OBJS)
 	$(CC) -o $(TARGET) $(OBJS)
@@ -25,5 +25,6 @@ format-headers:
 
 format: format-code format-headers
 
-watcher.o: watcher.c fw.h
-fw.o: fw.c fw.h
+
+$(OUTDIR)/watcher.o: watcher.c fw.h
+$(OUTDIR)/fw.o: fw.c fw.h
