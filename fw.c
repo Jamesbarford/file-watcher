@@ -1,7 +1,5 @@
 #include <sys/types.h>
-#include <sys/epoll.h>
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -54,7 +52,7 @@ static int fwStateCreate(fwLoop *fwl) {
         goto error;
     }
 
-    if ((es->events = malloc(sizeof(struct kevent) * fwl->count)) == NULL) {
+    if ((es->events = malloc(sizeof(struct kevent) * fwl->max_events)) == NULL) {
         goto error;
     }
 
@@ -117,7 +115,7 @@ static int fwPoll(fwLoop *fwl) {
     fwEvtState *es = fwLoopGetState(fwl);
     int fdcount = 0;
 
-    fdcount = kevent(es->kfd, NULL, 0, es->events, fwl->count, NULL);
+    fdcount = kevent(es->kfd, NULL, 0, es->events, fwl->max_events, NULL);
 
     if (fdcount == -1) {
         return FW_EVT_ERR;
@@ -151,6 +149,7 @@ static int fwPoll(fwLoop *fwl) {
  * ===========================================================================*/
 
 #elif defined(IS_LINUX)
+#include <sys/epoll.h>
 #include <sys/inotify.h>
 
 #define EVENT_SIZE    (sizeof(struct inotify_event))
@@ -499,7 +498,10 @@ void fwLoopProcessEvents(fwLoop *fwl) {
         fwEvt *ev = &fwl->idle[fd];
         int mask = fwl->active[i].mask;
         
-        fwEvtWatch(ev, fwl, fd, mask);
+        /* IF some kind of event */
+        if (mask) {
+            fwEvtWatch(ev, fwl, fd, mask);
+        }
         fwl->processed++;
     }
 }
