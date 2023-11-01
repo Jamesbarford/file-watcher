@@ -21,12 +21,26 @@ typedef struct watchedFile {
 } watchedFile;
 
 typedef struct watchState {
-    watchedFile *fws;
     size_t capacity;
     size_t count;
-    char *command;
     int max_open;
+    char *command;
+    watchedFile *fws;
 } watchState;
+
+typedef struct fileEntry {
+    int fd;
+    char *name;
+    int name_len;
+    struct fileEntry *next;
+} fileEntry;
+
+typedef struct fileTable {
+    int size;
+    int capacity;
+    int mask;
+    fileEntry **entries;
+} fileTable;
 
 static char *command = NULL;
 
@@ -51,21 +65,97 @@ static char *command = NULL;
 
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
 #define statFileUpdated(sb) (sb.st_mtimespec.tv_sec)
+#define statFileCreated(sb) (sb.st_birthtimespec.tv_sec)
+#define OPEN_FILE_FLAGS (O_RDONLY | O_EVTONLY)
 #elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
         defined(__NetBSD__)
-#define statFileUpdated(sb) (sb.st_mtime)
+#define statFileUpdated(sb) (sb.st_mtim.tv_sec)
+#define ststatFileCreated(sb) (sb.st_ctim.tv_sec)
+#define OPEN_FILE_FLAGS (O_RDONLY)
 #else
-#error "Cannot determine how to get update time from 'struct stat'"
+#error "Cannot determine how to get information time from 'struct stat'"
 #endif
 
-#if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
-#define statFileCreated(sb) (sb.st_birthtimespec.tv_sec)
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
-        defined(__NetBSD__)
-#define ststatFileCreated(sb) (sb.st_ctime;)
-#else
-#error "Cannot determine how to get created time from 'struct stat'"
-#endif
+fileTable *fileTableNew(void) {
+    fileTable *ft = malloc(sizeof(fileTable));
+    ft->capacity = 16;
+    ft->mask = ft->capacity - 1;
+    ft->size = 0;
+    ft->entries = malloc(sizeof(fileEntry * ) * ft->capacity);
+    return ft;
+}
+
+int fileTableHas(fileTable *ft, int fd) {
+    if (fd == -1) {
+        return 0;
+    }
+
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *fe = ft->entries[hash_idx]; 
+    while (fe) {
+        if (fe->fd == fd) {
+            return 1;
+        }
+        fe = fe->next;
+    }
+    return 0;
+}
+
+int fileTableAdd(fileTable *ft, int fd, char *name, int name_len) {
+    if (fileTableHas(ft, fd)) {
+        return 0;
+    }
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *newfe = malloc(sizeof(fileEntry));
+    newfe->fd = fd;
+    newfe->name = name;
+    newfe->name_len = name_len;
+    newfe->next = ft->entries[hash_idx];
+    ft->entries[hash_idx] = newfe;
+    ft->size++;
+    return 0;
+}
+
+fileEntry *fileTableGet(fileTable *ft, int fd) {
+    if (fd == -1) {
+        return NULL;
+    }
+
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+    fileEntry *fe = ft->entries[hash_idx]; 
+    while (fe) {
+        if (fe->fd == fd) {
+            return fe;
+        }
+        fe = fe->next;
+    }
+    return NULL;
+}
+
+fileEntry *fileTableDelete(fileTable *ft, int fd) {
+    fileEntry *prev, *next, *fe;
+    unsigned int hash_idx = (unsigned int)(fd & ft->capacity);
+
+    fe = ft->entries[hash_idx];
+    prev = NULL;
+    while (fe) {
+        next = fe->next;
+        if (fe->fd) {
+            if (prev) {
+                prev->next = next;
+                fe->next = NULL;
+                return fe;
+            } else {
+                ft->entries[hash_idx] = next;
+                fe->next = NULL;
+                return fe;
+            }
+        }
+        prev = fe;
+        fe = fe->next;
+    } 
+    return NULL;
+}
 
 watchState *watchStateNew(char *command, int max_open) {
     watchState *ws = malloc(sizeof(watchState));
@@ -91,10 +181,10 @@ void watchStateRelease(watchState *ws) {
 int watchStateAddFile(watchState *ws, char *file_name) {
     struct stat sb;
     int fd;
+    char abspath[1048];
 
     if (ws->count >= ws->max_open) {
         fwWarn("Trying to add more than: %d files\n", ws->max_open);
-        close(ws->count);
         return -1;
     }
 
@@ -103,7 +193,7 @@ int watchStateAddFile(watchState *ws, char *file_name) {
         ws->capacity *= 2;
     }
 
-    if ((fd = open(file_name, O_EVTONLY | O_RDONLY, 0644)) == -1) {
+    if ((fd = open(file_name, OPEN_FILE_FLAGS , 0644)) == -1) {
         return -1;
     }
 
@@ -114,8 +204,13 @@ int watchStateAddFile(watchState *ws, char *file_name) {
         return -1;
     }
 
+    if (realpath(file_name, abspath) == NULL) {
+        close(ws->fws[ws->count].fd);
+        return -1;
+    }
+
     ws->fws[ws->count].last_update = statFileUpdated(sb);
-    ws->fws[ws->count].name = strdup(file_name);
+    ws->fws[ws->count].name = strdup(abspath);
 
     ws->count++;
     return 0;
@@ -152,13 +247,13 @@ int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
         switch (dr->d_type) {
         case DT_REG:
             if (!strlen(dr->d_name) && dr->d_name[0] == '.' ||
-                !strlen(dr->d_name) && dr->d_name[0] == '.' &&
+                strlen(dr->d_name) == 2 && dr->d_name[0] == '.' &&
                         dr->d_name[1] == '.') {
                 continue;
             }
 
             should_add = 1;
-            len = snprintf(full_path, sizeof(full_path), "%s%s", dirname,
+            len = snprintf(full_path, sizeof(full_path), "%s/%s", dirname,
                            dr->d_name);
             full_path[len] = '\0';
             if (ext) {
@@ -188,7 +283,10 @@ int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
 void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
     watchedFile *fw = (watchedFile *)data;
     struct stat sb;
-    if (type & FW_EVT_DELETE) {
+
+    printf("IN LISTENER: 0x%0x 0x%0x\n", type, FW_EVT_DELETE|FW_EVT_WATCH);
+    if (type & (FW_EVT_DELETE|FW_EVT_WATCH)) {
+        printf("opening and closing\n");
         close(fw->fd);
         if (access(fw->name, F_OK) == -1 && errno == ENOENT) {
             printf("DELETED: %s\n", fw->name);
@@ -197,15 +295,16 @@ void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
             fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
             return;
         } else {
-            printf("CHANGED: %s\n", fw->name);
+            printf("1CHANGED:%d-> %s\n",fw->fd, fw->name);
             fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
-            fw->fd = open(fw->name, O_EVTONLY | O_RDONLY, 0644);
-            fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH, watchFileListener, fw);
+            fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
+            fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH,
+                    watchFileListener, fw);
         }
     } else if (type & FW_EVT_WATCH) {
-        printf("CHANGED: %s\n", fw->name);
+        printf("2CHANGED: %s\n", fw->name);
     }
-    if (fstat(fw->fd, &sb) == -1) {
+    if (stat(fw->name, &sb) == -1) {
         fwWarn("Could not update stats for file: %s\n", fw->name);
         return;
     }
@@ -232,9 +331,13 @@ void watchForChanges(watchState *ws) {
         struct stat st;
         fstat(fw->fd, &st);
         fw->size = st.st_size;
-        fwLoopAddEvent(evt_loop, fw->fd, FW_EVT_WATCH, watchFileListener, fw);
+        if (fwLoopAddEvent(evt_loop, fw->fd, FW_EVT_WATCH, watchFileListener, fw) == FW_EVT_ERR) {
+            perror("??\n");
+            exit(1);
+        }
     }
 
+    printf("starting loop\n");
     fwLoopMain(evt_loop);
     for (int i = 0; i < ws->count; ++i) {
         fwLoopDeleteEvent(evt_loop, ws->fws[i].fd, FW_EVT_WATCH);
@@ -253,7 +356,7 @@ int main(int argc, char **argv) {
 
     watchStateAddDirectory(ws, dirname, ".c", 2);
     watchStateAddDirectory(ws, dirname, ".h", 2);
-    watchStateAddFile(ws, "./Makefile");
+    //watchStateAddFile(ws, "./foo.txt");
 
     if (ws->count == 0) {
         fwPanic("Failed to open all files\n");
