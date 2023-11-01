@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "fw.h"
+#include "osconfig.h"
 
 typedef struct watchedFile {
     int fd;
@@ -63,12 +64,11 @@ static char *command = NULL;
         fprintf(stderr, __VA_ARGS__);                                  \
     } while (0)
 
-#if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
-#define statFileUpdated(sb) (sb.st_mtimespec.tv_sec)
-#define statFileCreated(sb) (sb.st_birthtimespec.tv_sec)
-#define OPEN_FILE_FLAGS (O_RDONLY | O_EVTONLY)
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
-        defined(__NetBSD__)
+#if defined(IS_BSD)
+#define statFileUpdated(sb) (sb.st_mtime)
+#define statFileCreated(sb) (sb.st_birthtime)
+#define OPEN_FILE_FLAGS (O_RDONLY)
+#elif defined(IS_LINUX)
 #define statFileUpdated(sb) (sb.st_mtim.tv_sec)
 #define ststatFileCreated(sb) (sb.st_ctim.tv_sec)
 #define OPEN_FILE_FLAGS (O_RDONLY)
