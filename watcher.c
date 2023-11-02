@@ -1,10 +1,12 @@
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +46,7 @@ typedef struct fileTable {
 } fileTable;
 
 static char *command = NULL;
+static pid_t child_p = -1;
 
 #define fwPanic(...)                                                   \
     do {                                                               \
@@ -280,13 +283,28 @@ int watchStateAddDirectory(watchState *ws, char *dirname, char *ext,
     return 0;
 }
 
+void watcherReRunCommand(void) {
+    /* Kill the previous session if required */
+    if (child_p != -1) {
+        printf("child_p: %d\n", child_p);
+        kill(child_p, SIGTERM); // Use SIGTERM to allow child to cleanup
+        waitpid(child_p, NULL, 0); // Reap the child process
+        printf("Parent: Child terminated\n");
+    }
+
+    if ((child_p = fork()) == 0) {
+        system(command);
+        execlp();
+        exit(EXIT_SUCCESS); // Make sure to exit after the system call in child
+    }
+}
+
+
 void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
     watchedFile *fw = (watchedFile *)data;
     struct stat sb;
 
-    printf("IN LISTENER: 0x%0x 0x%0x\n", type, FW_EVT_DELETE|FW_EVT_WATCH);
     if (type & (FW_EVT_DELETE|FW_EVT_WATCH)) {
-        printf("opening and closing\n");
         close(fw->fd);
         if (access(fw->name, F_OK) == -1 && errno == ENOENT) {
             printf("DELETED: %s\n", fw->name);
@@ -295,32 +313,21 @@ void watchFileListener(fwLoop *fwl, int fd, void *data, int type) {
             fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
             return;
         } else {
-            printf("1CHANGED:%d-> %s\n",fw->fd, fw->name);
             fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
             fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
             fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH,
                     watchFileListener, fw);
         }
-    } else if (type & FW_EVT_WATCH) {
-        printf("2CHANGED: %s\n", fw->name);
-    }
-    if (stat(fw->name, &sb) == -1) {
-        fwWarn("Could not update stats for file: %s\n", fw->name);
-        return;
-    }
 
-    FILE *fp = popen(command, "r");
-    if (fp == NULL) {
-        fwWarn("Failed to run command: %s\n", command);
-    }
-    char buffer[100];
-    while (fgets(buffer, sizeof(buffer) - 1, fp) != NULL) {
-        printf("%s", buffer);
-    }
-    pclose(fp);
+        if (stat(fw->name, &sb) == -1) {
+            fwWarn("Could not update stats for file: %s\n", fw->name);
+            return;
+        }
 
-    fw->size = sb.st_size;
-    fw->last_update = statFileUpdated(sb);
+        fw->size = sb.st_size;
+        fw->last_update = statFileUpdated(sb);
+        watcherReRunCommand();
+    } 
 }
 
 void watchForChanges(watchState *ws) {
@@ -345,18 +352,30 @@ void watchForChanges(watchState *ws) {
     watchStateRelease(ws);
 }
 
+void sigtermHandler(int sig) {
+    printf("shutdown \n");
+    kill(child_p, SIGTERM);
+    exit(EXIT_SUCCESS);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fwPanic("Usage: %s <cmd> <dir>\n", argv[0]);
     }
 
+    struct sigaction act;
+    act.sa_handler = sigtermHandler;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    sigaction(SIGINT, &act, NULL);
+
     command = argv[1];
     char *dirname = argv[2];
     watchState *ws = watchStateNew(command, INT_MAX);
 
-    watchStateAddDirectory(ws, dirname, ".c", 2);
-    watchStateAddDirectory(ws, dirname, ".h", 2);
-    //watchStateAddFile(ws, "./foo.txt");
+    //watchStateAddDirectory(ws, dirname, ".c", 2);
+    //watchStateAddDirectory(ws, dirname, ".h", 2);
+    watchStateAddFile(ws, "./sample-files/foo.txt");
 
     if (ws->count == 0) {
         fwPanic("Failed to open all files\n");
