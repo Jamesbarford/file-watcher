@@ -8,7 +8,7 @@ $(OUTDIR)/%.o: %.c
 
 all: $(TARGET)
 
-OBJS = $(OUTDIR)/watcher.o $(OUTDIR)/fw.o
+OBJS = $(OUTDIR)/main.o $(OUTDIR)/fw.o
 
 $(TARGET): $(OBJS)
 	$(CC) -o $(TARGET) $(OBJS)
@@ -26,5 +26,5 @@ format-headers:
 format: format-code format-headers
 
 
-$(OUTDIR)/watcher.o: watcher.c fw.h
+$(OUTDIR)/main.o: main.c fw.h
 $(OUTDIR)/fw.o: fw.c fw.h

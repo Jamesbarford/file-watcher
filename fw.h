@@ -16,26 +16,24 @@
 #define FW_EVT_ERR -1
 #define FW_EVT_OK  1
 
-typedef struct fwLoop fwLoop;
 typedef struct fwState fwState;
 
-typedef void fwEvtCallback(fwLoop *fwl, int fd, void *data, int type);
+typedef void fwEvtCallback(fwState *fws, int fd, void *data, int type);
 
-void fwAddFiles(fwState *ws, int argc, ...);
-int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen);
-int fwAddFile(fwState *ws, char *file_name);
+void fwAddFiles(fwState *fws, int argc, ...);
+int fwAddDirectory(fwState *fws, char *dirname, char *ext, int extlen);
+int fwAddFile(fwState *fws, char *file_name);
 
 fwState *fwStateNew(char *command, int max_open, int timeout);
-void fwStateRelease(fwState *ws);
+void fwStateRelease(fwState *fws);
 
-fwLoop *fwLoopNew(int eventcount, int timeout);
-void fwLoopProcessEvents(fwLoop *fwl);
-void fwLoopMain(fwState *ws);
-void fwLoopStop(fwLoop *fwl);
-size_t fwLoopGetProcessedEventCount(fwLoop *fwl);
+void fwLoopProcessEvents(fwState *fws);
+void fwLoopMain(fwState *fws);
+void fwLoopStop(fwState *fws);
+size_t fwLoopGetProcessedEventCount(fwState *fws);
 
-void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask);
-int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
+void fwLoopDeleteEvent(fwState *fws, int fd, int mask);
+int fwLoopAddEvent(fwState *fws, int fd, int mask, fwEvtCallback *cb,
                    void *data);
 
 #endif // !FW_H

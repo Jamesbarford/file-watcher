@@ -26,26 +26,6 @@ typedef struct fwEvt {
     void *data;
 } fwEvt;
 
-/* the loop itself */
-typedef struct fwLoop {
-    /* highest number filedescriptor we have seen thus far */
-    int max;
-    /* Maximum number of events */
-    int max_events;
-    /* Optional timeout for the event loop */
-    int timeout;
-    /* Event loop filedescriptor */
-    int fd;
-    /* How many events have been processed */
-    size_t processed;
-    /* Control start / stopping of the event loop */
-    int run;
-    fwEvt *idle;
-    /* Events ready */
-    fwEvt *active;
-    void *state; /* Allow for generic implementation of state */
-} fwLoop;
-
 typedef struct fwFile {
     /* Filedescriptor */
     int fd;
@@ -63,16 +43,27 @@ typedef struct fwState {
     /* How many files we are tracking in fws */
     size_t count;
     /* Maximum number of files we can track */
-    int max_open;
-    /* Command to repeatedly run */
+    int max_events;
+    /* Command to repeatedly run for this context */
     char *command;
+    /* How many events have been processed */
+    size_t processed;
+    /* 1 = run event loop, 0 = stop */
+    int run;
+    /* Current highest open filedescriptor */
+    int max;
+    /* How long to poll for, set to -1 to never stop */
+    int timeout;
     /* Array of files */
-    fwFile *fws;
+    fwFile *files;
     /* Event loop for watching the files */
-    fwLoop *fwl;
+    fwEvt *idle;
+    /* Events ready */
+    fwEvt *active;
+    /* Allow for generic implementation of state */
+    void *state; 
 } fwState;
 
-static char *command = NULL;
 static pid_t child_p = -1;
 
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6) || \
@@ -116,7 +107,7 @@ static pid_t child_p = -1;
 #if defined(IS_BSD)
 #define statFileUpdated(sb) (sb.st_mtime)
 #define statFileCreated(sb) (sb.st_birthtime)
-#define OPEN_FILE_FLAGS     (O_RDONLY|O_EVTONLY)
+#define OPEN_FILE_FLAGS     (O_RDONLY)
 #elif defined(IS_LINUX)
 #define statFileUpdated(sb)   (sb.st_mtim.tv_sec)
 #define ststatFileCreated(sb) (sb.st_ctim.tv_sec)
@@ -125,7 +116,7 @@ static pid_t child_p = -1;
 #error "Cannot determine how to get information time from 'struct stat'"
 #endif
 
-#define fwLoopGetState(fwl) ((fwl)->state)
+#define fwLoopGetEvtState(fwl) ((fwl)->state)
 
 #define fwEvtWatch(ev, fwl, fd, mask) \
     ((ev)->watch((fwl), (fd), (ev)->data, (mask)))
@@ -143,15 +134,14 @@ typedef struct fwEvtState {
 
 #define __kevent(kfd, ev) (kevent((kfd), (ev), 1, NULL, 0, NULL))
 
-static int fwLoopStateNew(fwLoop *fwl) {
+static fwEvtState *fwLoopStateNew(int max_events) {
     fwEvtState *es;
 
     if ((es = malloc(sizeof(fwEvtState))) == NULL) {
         goto error;
     }
 
-    if ((es->events = malloc(sizeof(struct kevent) * fwl->max_events)) ==
-        NULL) {
+    if ((es->events = malloc(sizeof(struct kevent) * max_events)) == NULL) {
         goto error;
     }
 
@@ -159,10 +149,9 @@ static int fwLoopStateNew(fwLoop *fwl) {
         fwDebug("Failed to invoke kqueue(): %s\n", strerror(errno));
         goto error;
     }
+    fwDebug("kqueue() fd=%d\n", es->kfd);
 
-    fwl->state = es;
-
-    return FW_EVT_OK;
+    return es;
 
 error:
     if (es && es->events) {
@@ -171,40 +160,30 @@ error:
     if (es) {
         free(es);
     }
-    return FW_EVT_ERR;
-}
-
-static void fwLoopStateRelease(fwLoop *fwl) {
-    if (fwl) {
-        fwEvtState *es = fwLoopGetState(fwl);
-        if (es) {
-            close(es->kfd);
-            free(es->events);
-            free(es);
-        }
-    }
+    return NULL;
 }
 
 /* Add a filedescriptor for kqueue to watch */
-static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
-    fwEvtState *es = fwLoopGetState(fwl);
+static int fwLoopStateAdd(fwState *fws, int fd, int mask) {
+    fwEvtState *es = fwLoopGetEvtState(fws);
     struct kevent change;
 
     /* WATCH is the most generic one, adding everything for now */
     if (mask & FW_EVT_WATCH) {
-        EV_SET(&change, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+        EV_SET(&change, fd, EVFILT_VNODE, EV_ADD,
                NOTE_WRITE | NOTE_DELETE | NOTE_EXTEND | NOTE_ATTRIB, 0, 0);
-        fwDebug("%d\n", change.ident);
         if (kevent(es->kfd, &change, 1, NULL, 0, NULL) == -1) {
-            fwDebug("Failed to add: %d to queue: %s\n", fd, strerror(errno));
+            fwDebug("kqueue() fd=%d\n", es->kfd);
+            fwDebug("%lu\n", change.ident);
+            printf("%d %s\n",errno, strerror(errno));
             return FW_EVT_ERR;
         }
     }
     return FW_EVT_OK;
 }
 
-static void fwLoopStateDelete(fwLoop *fwl, int fd, int mask) {
-    fwEvtState *es = fwl->state;
+static void fwLoopStateDelete(fwState *fws, int fd, int mask) {
+    fwEvtState *es = fws->state;
     struct kevent event;
 
     /* Remove this event for the kqueue */
@@ -213,11 +192,11 @@ static void fwLoopStateDelete(fwLoop *fwl, int fd, int mask) {
 }
 
 /* Check for activity on a file descriptor */
-static int fwLoopPoll(fwLoop *fwl) {
-    fwEvtState *es = fwLoopGetState(fwl);
+static int fwLoopPoll(fwState *fws) {
+    fwEvtState *es = fwLoopGetEvtState(fws);
     int fdcount = 0;
 
-    fdcount = kevent(es->kfd, NULL, 0, es->events, fwl->max_events, NULL);
+    fdcount = kevent(es->kfd, NULL, 0, es->events, fws->max_events, NULL);
 
     if (fdcount == -1) {
         return FW_EVT_ERR;
@@ -238,8 +217,8 @@ static int fwLoopPoll(fwLoop *fwl) {
                 newmask |= FW_EVT_DELETE;
             }
 
-            fwl->active[i].fd = change->ident;
-            fwl->active[i].mask = newmask;
+            fws->active[i].fd = change->ident;
+            fws->active[i].mask = newmask;
         }
     } else if (fdcount == -1) {
         return FW_EVT_ERR;
@@ -317,7 +296,7 @@ error:
 static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
     int wfd, len;
     char abspath[1048], procpath[1048];
-    fwEvtState *es = fwLoopGetState(fwl);
+    fwEvtState *es = fwLoopGetEvtState(fwl);
     pid_t pid;
     int flags = 0;
 
@@ -365,14 +344,14 @@ static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
 }
 
 static void fwLoopStateDelete(fwLoop *fwl, int wfd, int mask) {
-    fwEvtState *es = fwLoopGetState(fwl);
+    fwEvtState *es = fwLoopGetEvtState(fwl);
     /* Get rid of file from watched files, this may well error */
     (void)inotify_rm_watch(es->ifd, wfd);
 }
 
 static void fwLoopStateRelease(fwLoop *fwl) {
     if (fwl) {
-        fwEvtState *es = fwLoopGetState(fwl);
+        fwEvtState *es = fwLoopGetEvtState(fwl);
         if (es) {
             epoll_ctl(es->epollfd, EPOLL_CTL_DEL, es->ifd, es->ev);
             free(es->events);
@@ -385,7 +364,7 @@ static void fwLoopStateRelease(fwLoop *fwl) {
 }
 
 static int fwLoopPoll(fwLoop *fwl) {
-    fwEvtState *es = fwLoopGetState(fwl);
+    fwEvtState *es = fwLoopGetEvtState(fwl);
     fwEvt *evt;
     struct inotify_event *event;
     struct epoll_event *change;
@@ -467,77 +446,26 @@ static int fwLoopPoll(fwLoop *fwl) {
  * GENERIC API
  *============================================================================*/
 
-fwLoop *fwLoopNew(int eventcount, int timeout) {
-    int eventssize;
-    fwLoop *fwl;
-    fwEvt *idle, *active;
-
-    fwl = NULL;
-    idle = active = NULL;
-
-    if ((fwl = malloc(sizeof(fwLoop))) == NULL) {
-        goto error;
-    }
-
-    if ((idle = malloc(sizeof(fwEvt) * eventcount)) == NULL) {
-        goto error;
-    }
-
-    if ((active = malloc(sizeof(fwEvt) * eventcount)) == NULL) {
-        goto error;
-    }
-
-    fwl->max = -1;
-    fwl->max_events = eventcount;
-    fwl->idle = idle;
-    fwl->active = active;
-    fwl->timeout = timeout;
-    fwl->processed = 0;
-    fwl->run = 1;
-    for (int i = 0; i < fwl->max_events; ++i) {
-        fwl->idle[i].mask = FW_EVT_ADD;
-    }
-    if ((fwl->fd = fwLoopStateNew(fwl)) == FW_EVT_ERR) {
-        goto error;
-    }
-
-    return fwl;
-
-error:
-    if (fwl) {
-        free(fwl);
-    }
-    if (idle) {
-        free(idle);
-    }
-    if (active) {
-        free(active);
-    }
-
-    fwDebug("Failed to create eventloop\n");
-    return NULL;
-}
-
-int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
+int fwLoopAddEvent(fwState *fws, int fd, int mask, fwEvtCallback *cb,
                    void *data) {
     fwEvt *ev;
 
-    if (fd >= fwl->max_events) {
+    if (fd >= fws->max_events) {
         return FW_EVT_ERR;
     }
 
 #if defined(IS_BSD)
     fwDebug(">>%d\n", fd);
-    if (fwLoopStateAdd(fwl, fd, mask) == FW_EVT_ERR) {
+    if (fwLoopStateAdd(fws, fd, mask) == FW_EVT_ERR) {
         return FW_EVT_ERR;
     }
-    ev = &fwl->idle[fd];
+    ev = &fws->idle[fd];
 #endif
 
 /* We do not need the filedescriptor as inotify uses it's own filedescriptors */
 #if defined(IS_LINUX)
     int wfd = 0;
-    if ((wfd = fwLoopStateAdd(fwl, fd, mask)) == FW_EVT_ERR) {
+    if ((wfd = fwLoopStateAdd(fws, fd, mask)) == FW_EVT_ERR) {
         return FW_EVT_ERR;
     }
     ev = &fwl->idle[wfd];
@@ -548,36 +476,36 @@ int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
     ev->data = data;
     ev->watch = cb;
 
-    if (fd > fwl->max) {
-        fwl->max = fd;
+    if (fd > fws->max) {
+        fws->max = fd;
     }
     fwDebug("HERE\n");
     return FW_EVT_OK;
 }
 
-void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask) {
+void fwLoopDeleteEvent(fwState *fws, int fd, int mask) {
     fwEvt *ev;
     int i;
 
-    if (fd >= fwl->max_events) {
+    if (fd >= fws->max_events) {
         return;
     }
 
-    ev = &fwl->idle[fd];
+    ev = &fws->idle[fd];
 
     if (ev->mask == FW_EVT_ADD) {
         return;
     }
 
-    fwLoopStateDelete(fwl, fd, mask);
+    fwLoopStateDelete(fws, fd, mask);
     ev->mask = ev->mask & (~mask);
-    if (fd == fwl->max && ev->mask == FW_EVT_ADD) {
-        for (i = fwl->max - 1; i >= 0; --i) {
-            if (fwl->idle[i].mask != FW_EVT_ADD) {
+    if (fd == fws->max && ev->mask == FW_EVT_ADD) {
+        for (i = fws->max - 1; i >= 0; --i) {
+            if (fws->idle[i].mask != FW_EVT_ADD) {
                 break;
             }
         }
-        fwl->max = i;
+        fws->max = i;
     }
 }
 
@@ -588,74 +516,157 @@ static void fwSigtermHandler(int sig) {
 }
 
 /* The dynamic array for storing file state */
-fwState *fwStateNew(char *command, int max_open, int timeout) {
+fwState *fwStateNew(char *command, int max_events, int timeout) {
     struct sigaction act;
-    fwLoop *fwl;
-    fwState *ws;
+    fwState *fws;
+    int eventssize;
 
-    if ((ws = malloc(sizeof(fwState))) == NULL) {
-        return NULL;
-    }
-    if ((ws->fws = malloc(sizeof(fwFile) * ws->capacity)) == NULL) {
-        free(ws);
+    if ((fws = malloc(sizeof(fwState))) == NULL) {
         return NULL;
     }
 
-    ws->count = 0;
-    ws->capacity = 10;
-    ws->command = command;
-    ws->max_open = max_open;
-    ws->fwl = fwLoopNew(ws->max_open, timeout);
+    if ((fws->files = malloc(sizeof(fwFile) * 10)) == NULL) {
+        free(fws);
+        return NULL;
+    }
 
+    if ((fws->idle = malloc(sizeof(fwEvt) * max_events)) == NULL) {
+        goto error;
+    }
+
+    if ((fws->active = malloc(sizeof(fwEvt) * max_events)) == NULL) {
+        goto error;
+    }
+
+    if ((fws->state = fwLoopStateNew(max_events)) == NULL) {
+        fwDebug("Failed to create state\n");
+        goto error;
+    }
+
+    fws->count = 0;
+    fws->capacity = 10;
+    fws->command = command;
+    fws->max_events = max_events;
+    fws->max = -1;
+    fws->timeout = timeout;
+    fws->processed = 0;
+    fws->run = 1;
     act.sa_handler = fwSigtermHandler;
     act.sa_flags = 0;
     sigemptyset(&act.sa_mask);
     sigaction(SIGINT, &act, NULL);
 
-    return ws;
+    for (int i = 0; i < fws->max_events; ++i) {
+        fws->idle[i].mask = FW_EVT_ADD;
+    }
+    fwDebug("Pre CREATE LOOP STATE\n");
+
+
+    return fws;
+
+error:
+    fwDebug("Failed to create eventloop\n");
+    if (fws->idle) {
+        free(fws->idle);
+    }
+    if (fws->active) {
+        free(fws->active);
+    }
+    if (fws) {
+        free(fws);
+    }
+
+    return NULL;
+
+
+    return fws;
 }
 
 void fwStateRelease(fwState *ws) {
     if (ws) {
         for (int i = 0; i < ws->count; ++i) {
-            free(ws->fws[i].name);
-            close(ws->fws[i].fd);
+            free(ws->files[i].name);
+            close(ws->files[i].fd);
         }
-        fwLoopStateRelease(ws->fwl);
-        free(ws->fws);
+        free(ws->files);
         free(ws);
     }
 }
 
-size_t fwLoopGetProcessedEventCount(fwLoop *fwl) {
-    return fwl->processed;
+size_t fwLoopGetProcessedEventCount(fwState *fws) {
+    return fws->processed;
 }
 
-void fwLoopStop(fwLoop *fwl) {
-    fwl->run = 0;
+void fwLoopStop(fwState *fws) {
+    fws->run = 0;
 }
 
-void fwLoopProcessEvents(fwLoop *fwl) {
+void fwLoopProcessEvents(fwState *fws) {
     int eventcount;
 
-    if (fwl->max == -1) {
+    if (fws->max == -1) {
         return;
     }
 
-    if ((eventcount = fwLoopPoll(fwl)) == FW_EVT_ERR) {
+    if ((eventcount = fwLoopPoll(fws)) == FW_EVT_ERR) {
         return;
     }
 
     for (int i = 0; i < eventcount; ++i) {
-        int fd = fwl->active[i].fd;
-        fwEvt *ev = &fwl->idle[fd];
-        int mask = fwl->active[i].mask;
+        int fd = fws->active[i].fd;
+        fwEvt *ev = &fws->idle[fd];
+        int mask = fws->active[i].mask;
 
         /* IF some kind of event */
         if (mask) {
-            fwEvtWatch(ev, fwl, fd, mask);
+            fwEvtWatch(ev, fws, fd, mask);
         }
-        fwl->processed++;
+        fws->processed++;
+    }
+}
+
+static void fwReRunCommand(char *command) {
+    /* Kill the previous session if required */
+    if (child_p != -1) {
+        fwDebug("child_p: %d\n", child_p);
+        kill(child_p, SIGTERM);    // Use SIGTERM to allow child to cleanup
+        waitpid(child_p, NULL, 0); // Reap the child process
+        fwDebug("Parent: Child terminated\n");
+    }
+
+    if ((child_p = fork()) == 0) {
+        fwDebug("Running command\n");
+        system(command);
+        exit(EXIT_SUCCESS); // Make sure to exit after the system call in child
+    }
+}
+
+static void fwListener(fwState *fws, int fd, void *data, int type) {
+    fwFile *fw = (fwFile *)data;
+    struct stat sb;
+
+    if (type & (FW_EVT_DELETE | FW_EVT_WATCH)) {
+        close(fw->fd);
+        if (access(fw->name, F_OK) == -1 && errno == ENOENT) {
+            fwDebug("DELETED: %s\n", fw->name);
+            free(fw->name);
+            free(fw);
+            fwLoopDeleteEvent(fws, fd, FW_EVT_WATCH);
+            return;
+        } else {
+            fwLoopDeleteEvent(fws, fd, FW_EVT_WATCH);
+            fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
+            fwLoopAddEvent(fws, fw->fd, FW_EVT_WATCH, fwListener, fw);
+        }
+
+        if (stat(fw->name, &sb) == -1) {
+            fwWarn("Could not update stats for file: %s\n", fw->name);
+            return;
+        }
+
+        fw->size = sb.st_size;
+        fw->last_update = statFileUpdated(sb);
+        fwReRunCommand(fws->command);
     }
 }
 
@@ -664,13 +675,13 @@ int fwAddFile(fwState *ws, char *file_name) {
     int fd;
     char abspath[1048];
 
-    if (ws->count >= ws->max_open) {
-        fwWarn("Trying to add more than: %d files\n", ws->max_open);
+    if (ws->count >= ws->max_events) {
+        fwWarn("Trying to add more than: %d files\n", ws->max_events);
         return -1;
     }
 
     if (ws->count >= ws->capacity) {
-        ws->fws = realloc(ws->fws, (ws->capacity * 2) * sizeof(fwState));
+        ws->files = realloc(ws->files, (ws->capacity * 2) * sizeof(fwState));
         ws->capacity *= 2;
     }
 
@@ -679,24 +690,33 @@ int fwAddFile(fwState *ws, char *file_name) {
         return -1;
     }
 
-    ws->fws[ws->count].fd = fd;
 
-    fwDebug("OPENED: fd=%d\n",fd);
-
-    if (fstat(ws->fws[ws->count].fd, &sb) == -1) {
+    if (fstat(fd, &sb) == -1) {
         fwDebug("Failed to add to fstat: %s\n", strerror(errno));
-        close(ws->fws[ws->count].fd);
+        close(fd);
         return -1;
     }
 
+    /* Get the absolute filepath of the file on disk */
     if (realpath(file_name, abspath) == NULL) {
         fwDebug("Failed to add to realpath: %s\n", strerror(errno));
-        close(ws->fws[ws->count].fd);
+        close(fd);
         return -1;
     }
 
-    ws->fws[ws->count].last_update = statFileUpdated(sb);
-    ws->fws[ws->count].name = strdup(abspath);
+    ws->files[ws->count].fd = fd;
+    ws->files[ws->count].last_update = statFileUpdated(sb);
+    ws->files[ws->count].size = sb.st_size;
+    ws->files[ws->count].name = strdup(abspath);
+
+    fwEvtState *evt = ws->state;
+    printf("kfd=%d\n", evt->kfd);
+
+    /* Add the file to the watch list */
+    if (fwLoopAddEvent(ws, ws->files[ws->count].fd, FW_EVT_WATCH, fwListener, &ws->files[ws->count]) == FW_EVT_ERR) {
+        fwDebug("Failed to add event: filename=%s fd=%d reason: %s\n", file_name, fd, strerror(errno));
+        exit(1);
+    }
 
     ws->count++;
     return 0;
@@ -728,7 +748,7 @@ int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen) {
         return -1;
     }
 
-    while ((dr = readdir(dir)) != NULL && files_open < ws->max_open) {
+    while ((dr = readdir(dir)) != NULL && files_open < ws->max_events) {
         switch (dr->d_type) {
         case DT_REG:
             if (!strlen(dr->d_name) && dr->d_name[0] == '.' ||
@@ -751,7 +771,7 @@ int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen) {
                 }
             }
             if (should_add) {
-                printf("ADDING : %s\n ", full_path);
+                fwDebug("ADDING : %s\n ", full_path);
                 fwAddFile(ws, full_path);
             }
             break;
@@ -762,75 +782,14 @@ int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen) {
             break;
         }
     }
+    closedir(dir);
     return 0;
 }
 
-static void fwReRunCommand(void) {
-    fwDebug("child_p: %d\n", child_p);
-    /* Kill the previous session if required */
-    if (child_p != -1) {
-        fwDebug("child_p: %d\n", child_p);
-        kill(child_p, SIGTERM);    // Use SIGTERM to allow child to cleanup
-        waitpid(child_p, NULL, 0); // Reap the child process
-        fwDebug("Parent: Child terminated\n");
-    }
 
-    if ((child_p = fork()) == 0) {
-        system(command);
-        exit(EXIT_SUCCESS); // Make sure to exit after the system call in child
-    }
-}
-
-static void fwListener(fwLoop *fwl, int fd, void *data, int type) {
-    fwFile *fw = (fwFile *)data;
-    struct stat sb;
-
-    if (type & (FW_EVT_DELETE | FW_EVT_WATCH)) {
-        close(fw->fd);
-        if (access(fw->name, F_OK) == -1 && errno == ENOENT) {
-            fwDebug("DELETED: %s\n", fw->name);
-            free(fw->name);
-            free(fw);
-            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
-            return;
-        } else {
-            fwLoopDeleteEvent(fwl, fd, FW_EVT_WATCH);
-            fw->fd = open(fw->name, OPEN_FILE_FLAGS, 0644);
-            fwLoopAddEvent(fwl, fw->fd, FW_EVT_WATCH, fwListener, fw);
-        }
-
-        if (stat(fw->name, &sb) == -1) {
-            fwWarn("Could not update stats for file: %s\n", fw->name);
-            return;
-        }
-
-        fw->size = sb.st_size;
-        fw->last_update = statFileUpdated(sb);
-        fwReRunCommand();
-    }
-}
-
-void fwLoopMain(fwState *ws) {
-    fwFile *fw;
-    struct stat st;
-
-    /* Add all files for watching */
-    for (int i = 0; i < ws->count; ++i) {
-        fw = &ws->fws[i];
-        if(stat(fw->name, &st) == -1) {
-            perror("Failed to stat");
-            exit(1);
-        }
-        fw->size = st.st_size;
-        fwDebug("%s %d %zu\n", fw->name, fw->fd, fw->size);
-        if (fwLoopAddEvent(ws->fwl, fw->fd, FW_EVT_WATCH, fwListener, fw) == FW_EVT_ERR) {
-            perror("Failed to add event: ");
-            exit(1);
-        }
-    }
-
+void fwLoopMain(fwState *fws) {
     /* Run the event loop */
-    while (ws->fwl->run) {
-        fwLoopProcessEvents(ws->fwl);
+    while (fws->run) {
+        fwLoopProcessEvents(fws);
     }
 }
