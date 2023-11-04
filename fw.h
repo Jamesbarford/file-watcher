@@ -17,15 +17,25 @@
 #define FW_EVT_OK  1
 
 typedef struct fwLoop fwLoop;
+typedef struct fwState fwState;
 
 typedef void fwEvtCallback(fwLoop *fwl, int fd, void *data, int type);
 
+void fwAddFiles(fwState *ws, int argc, ...);
+int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen);
+int fwAddFile(fwState *ws, char *file_name);
+
+fwState *fwStateNew(char *command, int max_open, int timeout);
+void fwStateRelease(fwState *ws);
+
+fwLoop *fwLoopNew(int eventcount, int timeout);
 void fwLoopProcessEvents(fwLoop *fwl);
-void fwLoopMain(fwLoop *fwl);
+void fwLoopMain(fwState *ws);
 void fwLoopStop(fwLoop *fwl);
 size_t fwLoopGetProcessedEventCount(fwLoop *fwl);
+
 void fwLoopDeleteEvent(fwLoop *fwl, int fd, int mask);
-fwLoop *fwLoopNew(int eventcount, int timeout);
-int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb, void *data);
+int fwLoopAddEvent(fwLoop *fwl, int fd, int mask, fwEvtCallback *cb,
+                   void *data);
 
 #endif // !FW_H
