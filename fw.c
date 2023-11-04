@@ -56,11 +56,11 @@ typedef struct fwState {
     int timeout;
     /* Array of files */
     fwFile *files;
-    /* Event loop for watching the files */
+    /* Events that are idle */
     fwEvt *idle;
     /* Events ready */
     fwEvt *active;
-    /* Allow for generic implementation of state */
+    /* Allow for OS specific implementation */
     void *state; 
 } fwState;
 
@@ -80,19 +80,14 @@ static pid_t child_p = -1;
         exit(EXIT_FAILURE);                                            \
     } while (0)
 
+
+#ifdef DEBUG
 #define fwWarn(...)                                                    \
     do {                                                               \
         fprintf(stderr, "- %s:%d:%s  ", __FILE__, __LINE__, __func__); \
         fprintf(stderr, __VA_ARGS__);                                  \
     } while (0)
 
-#define fwInfo(...)                                                    \
-    do {                                                               \
-        fprintf(stderr, "+ %s:%d:%s  ", __FILE__, __LINE__, __func__); \
-        fprintf(stderr, __VA_ARGS__);                                  \
-    } while (0)
-
-#ifdef DEBUG
 #define fwDebug(...)                                                   \
     do {                                                               \
         fprintf(stderr, "[DEBUG] %s:%d:%s  ", __FILE__, __LINE__,      \
@@ -101,6 +96,7 @@ static pid_t child_p = -1;
     } while (0)
 #else
 #define fwDebug(...)
+#define fwWarn(...)
 #endif
 
 
@@ -173,9 +169,6 @@ static int fwLoopStateAdd(fwState *fws, int fd, int mask) {
         EV_SET(&change, fd, EVFILT_VNODE, EV_ADD,
                NOTE_WRITE | NOTE_DELETE | NOTE_EXTEND | NOTE_ATTRIB, 0, 0);
         if (kevent(es->kfd, &change, 1, NULL, 0, NULL) == -1) {
-            fwDebug("kqueue() fd=%d\n", es->kfd);
-            fwDebug("%lu\n", change.ident);
-            printf("%d %s\n",errno, strerror(errno));
             return FW_EVT_ERR;
         }
     }
@@ -339,7 +332,6 @@ static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
     }
     close(fd);
 
-    printf("added ok: %d\n", wfd);
     return wfd;
 }
 
@@ -511,7 +503,9 @@ void fwLoopDeleteEvent(fwState *fws, int fd, int mask) {
 
 /* Kill the child process running the command */
 static void fwSigtermHandler(int sig) {
-    kill(child_p, SIGTERM);
+    if (child_p != -1) {
+        kill(child_p, SIGTERM);
+    }
     exit(EXIT_SUCCESS);
 }
 
@@ -710,7 +704,6 @@ int fwAddFile(fwState *ws, char *file_name) {
     ws->files[ws->count].name = strdup(abspath);
 
     fwEvtState *evt = ws->state;
-    printf("kfd=%d\n", evt->kfd);
 
     /* Add the file to the watch list */
     if (fwLoopAddEvent(ws, ws->files[ws->count].fd, FW_EVT_WATCH, fwListener, &ws->files[ws->count]) == FW_EVT_ERR) {
@@ -785,7 +778,6 @@ int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen) {
     closedir(dir);
     return 0;
 }
-
 
 void fwLoopMain(fwState *fws) {
     /* Run the event loop */
