@@ -38,30 +38,30 @@ typedef struct fwFile {
 } fwFile;
 
 typedef struct fwState {
-    /* How much memory we have for fws */
-    size_t capacity;
-    /* How many files we are tracking in fws */
-    size_t count;
     /* Maximum number of files we can track */
     int max_events;
     /* Command to repeatedly run for this context */
     char *command;
     /* How many events have been processed */
-    size_t processed;
+    size_t processed_events;
     /* 1 = run event loop, 0 = stop */
-    int run;
+    int run_loop;
     /* Current highest open filedescriptor */
-    int max;
+    int fd_current_max;
     /* How long to poll for, set to -1 to never stop */
-    int timeout;
+    int poll_timeout;
+    /* How many files we are tracking in fws */
+    size_t files_count;
+    /* How much memory we have for files array */
+    size_t files_mem_capacity;
     /* Array of files */
-    fwFile *files;
+    fwFile *files_array;
     /* Events that are idle */
     fwEvt *idle;
     /* Events ready */
     fwEvt *active;
     /* Allow for OS specific implementation */
-    void *state; 
+    void *evt_state; 
 } fwState;
 
 static pid_t child_p = -1;
@@ -112,10 +112,10 @@ static pid_t child_p = -1;
 #error "Cannot determine how to get information time from 'struct stat'"
 #endif
 
-#define fwLoopGetEvtState(fwl) ((fwl)->state)
+#define fwLoopGetEvtState(fwl) ((fwl)->evt_state)
 
-#define fwEvtWatch(ev, fwl, fd, mask) \
-    ((ev)->watch((fwl), (fd), (ev)->data, (mask)))
+#define fwEvtWatch(ev, fws, fd, mask) \
+    ((ev)->watch((fws), (fd), (ev)->data, (mask)))
 
 /** ===========================================================================
  * MAC OS implementation - kqueue
@@ -167,7 +167,7 @@ static int fwLoopStateAdd(fwState *fws, int fd, int mask) {
     /* WATCH is the most generic one, adding everything for now */
     if (mask & FW_EVT_WATCH) {
         EV_SET(&change, fd, EVFILT_VNODE, EV_ADD,
-               NOTE_WRITE | NOTE_DELETE | NOTE_EXTEND | NOTE_ATTRIB, 0, 0);
+               NOTE_WRITE | NOTE_FUNLOCK | NOTE_DELETE | NOTE_EXTEND | NOTE_ATTRIB, 0, 0);
         if (kevent(es->kfd, &change, 1, NULL, 0, NULL) == -1) {
             return FW_EVT_ERR;
         }
@@ -176,7 +176,7 @@ static int fwLoopStateAdd(fwState *fws, int fd, int mask) {
 }
 
 static void fwLoopStateDelete(fwState *fws, int fd, int mask) {
-    fwEvtState *es = fws->state;
+    fwEvtState *es = fws->evt_state;
     struct kevent event;
 
     /* Remove this event for the kqueue */
@@ -218,6 +218,15 @@ static int fwLoopPoll(fwState *fws) {
     }
 
     return fdcount;
+}
+
+static void fwEvtStateRelease(fwState *fws) {
+    fwEvtState *es = fwLoopGetEvtState(fws);
+    if (es) {
+        close(es->kfd);
+        free(es->events);
+        free(es);
+    }
 }
 /* MAC OS implementation END - kqueue
  * ===========================================================================*/
@@ -341,7 +350,7 @@ static void fwLoopStateDelete(fwLoop *fwl, int wfd, int mask) {
     (void)inotify_rm_watch(es->ifd, wfd);
 }
 
-static void fwLoopStateRelease(fwLoop *fwl) {
+static void fwEvtStateRelease(fwLoop *fwl) {
     if (fwl) {
         fwEvtState *es = fwLoopGetEvtState(fwl);
         if (es) {
@@ -468,8 +477,8 @@ int fwLoopAddEvent(fwState *fws, int fd, int mask, fwEvtCallback *cb,
     ev->data = data;
     ev->watch = cb;
 
-    if (fd > fws->max) {
-        fws->max = fd;
+    if (fd > fws->fd_current_max) {
+        fws->fd_current_max = fd;
     }
     fwDebug("HERE\n");
     return FW_EVT_OK;
@@ -491,13 +500,13 @@ void fwLoopDeleteEvent(fwState *fws, int fd, int mask) {
 
     fwLoopStateDelete(fws, fd, mask);
     ev->mask = ev->mask & (~mask);
-    if (fd == fws->max && ev->mask == FW_EVT_ADD) {
-        for (i = fws->max - 1; i >= 0; --i) {
+    if (fd == fws->fd_current_max && ev->mask == FW_EVT_ADD) {
+        for (i = fws->fd_current_max - 1; i >= 0; --i) {
             if (fws->idle[i].mask != FW_EVT_ADD) {
                 break;
             }
         }
-        fws->max = i;
+        fws->fd_current_max = i;
     }
 }
 
@@ -513,15 +522,18 @@ static void fwSigtermHandler(int sig) {
 fwState *fwStateNew(char *command, int max_events, int timeout) {
     struct sigaction act;
     fwState *fws;
-    int eventssize;
 
     if ((fws = malloc(sizeof(fwState))) == NULL) {
-        return NULL;
+        goto error;
     }
 
-    if ((fws->files = malloc(sizeof(fwFile) * 10)) == NULL) {
-        free(fws);
-        return NULL;
+    fws->files_array = NULL;
+    fws->idle = NULL;
+    fws->active = NULL;
+    fws->evt_state = NULL;
+
+    if ((fws->files_array = malloc(sizeof(fwFile) * 10)) == NULL) {
+        goto error;
     }
 
     if ((fws->idle = malloc(sizeof(fwEvt) * max_events)) == NULL) {
@@ -532,19 +544,18 @@ fwState *fwStateNew(char *command, int max_events, int timeout) {
         goto error;
     }
 
-    if ((fws->state = fwLoopStateNew(max_events)) == NULL) {
-        fwDebug("Failed to create state\n");
+    if ((fws->evt_state = fwLoopStateNew(max_events)) == NULL) {
         goto error;
     }
 
-    fws->count = 0;
-    fws->capacity = 10;
-    fws->command = command;
+    fws->files_count = 0;
+    fws->files_mem_capacity = 10;
+    fws->command = strdup(command);
     fws->max_events = max_events;
-    fws->max = -1;
-    fws->timeout = timeout;
-    fws->processed = 0;
-    fws->run = 1;
+    fws->fd_current_max = -1;
+    fws->poll_timeout = timeout;
+    fws->processed_events = 0;
+    fws->run_loop = 1;
     act.sa_handler = fwSigtermHandler;
     act.sa_flags = 0;
     sigemptyset(&act.sa_mask);
@@ -566,6 +577,9 @@ error:
     if (fws->active) {
         free(fws->active);
     }
+    if (fws->evt_state) {
+        free(fws->evt_state);
+    }
     if (fws) {
         free(fws);
     }
@@ -576,29 +590,33 @@ error:
     return fws;
 }
 
-void fwStateRelease(fwState *ws) {
-    if (ws) {
-        for (int i = 0; i < ws->count; ++i) {
-            free(ws->files[i].name);
-            close(ws->files[i].fd);
+/* Destroy the event loop and OS specific event state. Closes all open file 
+ * descriptors, names of files and command */
+void fwStateRelease(fwState *fws) {
+    if (fws) {
+        for (int i = 0; i < fws->files_count; ++i) {
+            free(fws->files_array[i].name);
+            close(fws->files_array[i].fd);
         }
-        free(ws->files);
-        free(ws);
+        free(fws->files_array);
+        free(fws->command);
+        fwEvtStateRelease(fws);
+        free(fws);
     }
 }
 
 size_t fwLoopGetProcessedEventCount(fwState *fws) {
-    return fws->processed;
+    return fws->processed_events;
 }
 
 void fwLoopStop(fwState *fws) {
-    fws->run = 0;
+    fws->run_loop = 0;
 }
 
 void fwLoopProcessEvents(fwState *fws) {
     int eventcount;
 
-    if (fws->max == -1) {
+    if (fws->fd_current_max == -1) {
         return;
     }
 
@@ -611,15 +629,17 @@ void fwLoopProcessEvents(fwState *fws) {
         fwEvt *ev = &fws->idle[fd];
         int mask = fws->active[i].mask;
 
-        /* IF some kind of event */
+        /* If some kind of event that the user has subscribed to
+         * TODO: maintain user defined flags? Although we make a best effort
+         * to map our flags to the OS types */
         if (mask) {
-            fwEvtWatch(ev, fws, fd, mask);
+            ev->watch(fws, fd, ev->data, mask);
         }
-        fws->processed++;
+        fws->processed_events++;
     }
 }
 
-static void fwReRunCommand(char *command) {
+static void fwRunCommand(char *command) {
     /* Kill the previous session if required */
     if (child_p != -1) {
         fwDebug("child_p: %d\n", child_p);
@@ -660,7 +680,7 @@ static void fwListener(fwState *fws, int fd, void *data, int type) {
 
         fw->size = sb.st_size;
         fw->last_update = statFileUpdated(sb);
-        fwReRunCommand(fws->command);
+        fwRunCommand(fws->command);
     }
 }
 
@@ -669,14 +689,14 @@ int fwAddFile(fwState *ws, char *file_name) {
     int fd;
     char abspath[1048];
 
-    if (ws->count >= ws->max_events) {
+    if (ws->files_count >= ws->max_events) {
         fwWarn("Trying to add more than: %d files\n", ws->max_events);
         return -1;
     }
 
-    if (ws->count >= ws->capacity) {
-        ws->files = realloc(ws->files, (ws->capacity * 2) * sizeof(fwState));
-        ws->capacity *= 2;
+    if (ws->files_count >= ws->files_mem_capacity) {
+        ws->files_array = realloc(ws->files_array, (ws->files_mem_capacity * 2) * sizeof(fwState));
+        ws->files_mem_capacity *= 2;
     }
 
     if ((fd = open(file_name, OPEN_FILE_FLAGS, 0644)) == -1) {
@@ -698,20 +718,20 @@ int fwAddFile(fwState *ws, char *file_name) {
         return -1;
     }
 
-    ws->files[ws->count].fd = fd;
-    ws->files[ws->count].last_update = statFileUpdated(sb);
-    ws->files[ws->count].size = sb.st_size;
-    ws->files[ws->count].name = strdup(abspath);
+    ws->files_array[ws->files_count].fd = fd;
+    ws->files_array[ws->files_count].last_update = statFileUpdated(sb);
+    ws->files_array[ws->files_count].size = sb.st_size;
+    ws->files_array[ws->files_count].name = strdup(abspath);
 
-    fwEvtState *evt = ws->state;
+    fwEvtState *evt = ws->evt_state;
 
     /* Add the file to the watch list */
-    if (fwLoopAddEvent(ws, ws->files[ws->count].fd, FW_EVT_WATCH, fwListener, &ws->files[ws->count]) == FW_EVT_ERR) {
+    if (fwLoopAddEvent(ws, ws->files_array[ws->files_count].fd, FW_EVT_WATCH, fwListener, &ws->files_array[ws->files_count]) == FW_EVT_ERR) {
         fwDebug("Failed to add event: filename=%s fd=%d reason: %s\n", file_name, fd, strerror(errno));
         exit(1);
     }
 
-    ws->count++;
+    ws->files_count++;
     return 0;
 }
 
@@ -781,7 +801,7 @@ int fwAddDirectory(fwState *ws, char *dirname, char *ext, int extlen) {
 
 void fwLoopMain(fwState *fws) {
     /* Run the event loop */
-    while (fws->run) {
+    while (fws->run_loop) {
         fwLoopProcessEvents(fws);
     }
 }

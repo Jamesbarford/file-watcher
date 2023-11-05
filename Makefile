@@ -1,7 +1,7 @@
 TARGET := watchme.out
 CC     := gcc
 OUTDIR := .
-CFLAGS = -O0 -DDEBUG -g
+CFLAGS = -O0 -g
 
 $(OUTDIR)/%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

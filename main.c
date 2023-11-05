@@ -1,7 +1,7 @@
 #include "fw.h"
 
 int main(void) {
-    fwState *fws = fwStateNew("echo hello", 256, -1);
-    fwAddFile(fws, "./sample-files/ex.txt");
+    fwState *fws = fwStateNew("python3 ./example.py", 256, -1);
+    fwAddFile(fws, "./example.py");
     fwLoopMain(fws);
 }
