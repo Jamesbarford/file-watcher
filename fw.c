@@ -245,7 +245,7 @@ typedef struct fwEvtState {
     struct epoll_event *ev;
 } fwEvtState;
 
-static int fwLoopStateNew(fwLoop *fwl) {
+static fwEvtState *fwLoopStateNew(int max_events) {
     fwEvtState *es;
 
     if ((es = malloc(sizeof(fwEvtState))) == NULL) {
@@ -256,7 +256,7 @@ static int fwLoopStateNew(fwLoop *fwl) {
         goto error;
     }
 
-    if ((es->events = malloc(sizeof(struct epoll_event) * fwl->max_events)) == NULL) {
+    if ((es->events = malloc(sizeof(struct epoll_event) * max_events)) == NULL) {
         goto error;
     }
 
@@ -274,9 +274,8 @@ static int fwLoopStateNew(fwLoop *fwl) {
         goto error;
     }
 
-    fwl->state = es;
 
-    return FW_EVT_OK;
+    return es;
 error:
     if (es) {
         free(es);
@@ -290,15 +289,15 @@ error:
     if (es->ifd != -1) {
         close(es->ifd);
     }
-    return FW_EVT_ERR;
+    return NULL;
 }
 
 /* https://stackoverflow.com/questions/16760364/using-inotify-why-is-my-watched-file-ignored
  */
-static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
+static int fwLoopStateAdd(fwState *fws, int fd, int mask) {
     int wfd, len;
     char abspath[1048], procpath[1048];
-    fwEvtState *es = fwLoopGetEvtState(fwl);
+    fwEvtState *es = fwLoopGetEvtState(fws);
     pid_t pid;
     int flags = 0;
 
@@ -344,15 +343,15 @@ static int fwLoopStateAdd(fwLoop *fwl, int fd, int mask) {
     return wfd;
 }
 
-static void fwLoopStateDelete(fwLoop *fwl, int wfd, int mask) {
-    fwEvtState *es = fwLoopGetEvtState(fwl);
+static void fwLoopStateDelete(fwState *fws, int wfd, int mask) {
+    fwEvtState *es = fwLoopGetEvtState(fws);
     /* Get rid of file from watched files, this may well error */
     (void)inotify_rm_watch(es->ifd, wfd);
 }
 
-static void fwEvtStateRelease(fwLoop *fwl) {
-    if (fwl) {
-        fwEvtState *es = fwLoopGetEvtState(fwl);
+static void fwEvtStateRelease(fwState *fws) {
+    if (fws) {
+        fwEvtState *es = fwLoopGetEvtState(fws);
         if (es) {
             epoll_ctl(es->epollfd, EPOLL_CTL_DEL, es->ifd, es->ev);
             free(es->events);
@@ -364,13 +363,13 @@ static void fwEvtStateRelease(fwLoop *fwl) {
     }
 }
 
-static int fwLoopPoll(fwLoop *fwl) {
-    fwEvtState *es = fwLoopGetEvtState(fwl);
+static int fwLoopPoll(fwState *fws) {
+    fwEvtState *es = fwLoopGetEvtState(fws);
     fwEvt *evt;
     struct inotify_event *event;
     struct epoll_event *change;
     char event_buffer[EVENT_BUF_LEN];
-    int fdcount = epoll_wait(es->epollfd, es->events, fwl->max_events, -1);
+    int fdcount = epoll_wait(es->epollfd, es->events, fws->max_events, -1);
     int event_count = 0;
     int j = 0;
     int cur_wfd = -1;
@@ -390,7 +389,7 @@ static int fwLoopPoll(fwLoop *fwl) {
             while (i < event_count) {
                 event = (struct inotify_event *)&event_buffer[i];
                 cur_wfd = event->wd;
-                evt = &fwl->active[j];
+                evt = &fws->active[j];
                 evt->fd = event->wd;
 
                 if (cur_wfd == -1) {
@@ -469,7 +468,7 @@ int fwLoopAddEvent(fwState *fws, int fd, int mask, fwEvtCallback *cb,
     if ((wfd = fwLoopStateAdd(fws, fd, mask)) == FW_EVT_ERR) {
         return FW_EVT_ERR;
     }
-    ev = &fwl->idle[wfd];
+    ev = &fws->idle[wfd];
     ev->fd = fd;
 #endif
 
